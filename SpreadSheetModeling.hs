@@ -5,11 +5,13 @@ import Control.Monad (forever)
 import Data.Char (ord, toUpper, isAlpha)
 import Data.Maybe (mapMaybe)
 import Text.Read (readMaybe)
+import qualified Data.Map as Map
+import Text.Printf (printf)
 
--- CellValue extended with cell references
+-- Types of spreadsheet cells
 data CellValue = Number Double
                | Formula (Spreadsheet -> Double)
-               | Reference String  
+               | Reference String 
 
 type Position = (Int, Int)
 type Spreadsheet = [(Position, CellValue)]
@@ -19,11 +21,11 @@ instance Show CellValue where
     show (Formula _) = "Formula"
     show (Reference ref) = ref
 
--- Convert column label to column index
+-- Convert column reference to column index
 columnToIndex :: String -> Int
 columnToIndex = foldl (\acc c -> acc * 26 + (ord (toUpper c) - ord 'A' + 1)) 0
 
--- Convert column index to column label
+-- Convert column index to column reference
 indexToColumn :: Int -> String
 indexToColumn 0 = ""
 indexToColumn n = indexToColumn ((n - 1) `div` 26) ++ [toEnum (ord 'A' + (n - 1) `mod` 26)]
@@ -41,8 +43,8 @@ positionToReference :: Position -> String
 positionToReference (row, col) = indexToColumn col ++ show row
 
 -- Detect if the spreadsheet has cyclic references
-hasCyclicReferences :: Spreadsheet -> Bool
-hasCyclicReferences sheet = not (null (findCycles sheet))
+isCyclic :: Spreadsheet -> Bool
+isCyclic sheet = not (null (findCycles sheet))
 
 -- Detect cycles in references
 findCycles :: Spreadsheet -> [[Position]]
@@ -62,20 +64,34 @@ findCycles sheet = mapMaybe findCycle sheet
 
 -- Function to convert a row of cells into a string
 showRow :: [(Position, CellValue)] -> String
-showRow row = unwords [show val | (_, val) <- row]
+showRow row = unwords [positionToReference pos ++ "=" ++ maybe "?" show (evalCell pos row) | (pos, _) <- row]
+
 
 -- Function to print the spreadsheet as a table
 printSpreadsheet :: Spreadsheet -> IO ()
 printSpreadsheet sheet = do
-    let sortedSheet = sortOn (fst . fst) sheet
-    let groupedRows = groupBy (\((r1,_),_) ((r2,_),_) -> r1 == r2) sortedSheet
-    putStrLn "\nSpreadsheet:"
-    mapM_ (putStrLn . showRow) groupedRows
+    let evaluated = Map.fromList [((r, c), maybe "?" show (evalCell (r, c) sheet)) | ((r, c), _) <- sheet]
+        rows = map fst (Map.keys evaluated)
+        cols = map snd (Map.keys evaluated)
+        maxRow = if null rows then 0 else maximum rows
+        maxCol = if null cols then 0 else maximum cols
+
+    -- Print column headers
+    putStr "    " -- offset for row labels
+    mapM_ (\c -> printf "%-8s" (indexToColumn c)) [1..maxCol]
+    putStrLn ""
+
+    -- Print each row with values
+    mapM_ (\r -> do
+        printf "%-4d" r
+        mapM_ (\c -> printf "%-8s" (Map.findWithDefault "?" (r, c) evaluated)) [1..maxCol]
+        putStrLn ""
+        ) [1..maxRow]
+
 
 --Exercises of the handout:
 
 -- 1. Evaluates a cell's value
--- Evaluate cell, including references
 evalCell :: Position -> Spreadsheet -> Maybe Double  
 evalCell pos sheet = case lookup pos sheet of
     Just (Number x) -> Just x
@@ -88,6 +104,7 @@ evalCell pos sheet = case lookup pos sheet of
                 Just newPos -> evalCell newPos sheet
                 Nothing -> Nothing
 
+--evaluate the cell but without the references
 --evalCell :: Position -> Spreadsheet -> Maybe Double  
 --evalCell pos sheet = case lookup pos sheet of
     --Just (Number x) -> Just x
@@ -114,9 +131,10 @@ countCellsBy pred = length . filterCellsByValue pred
 
 -- 6. Sums values in a given range (inclusive)
 sumRange :: Position -> Position -> Spreadsheet -> Double
-sumRange (r1, c1) (r2, c2) sheet = sum [eval val | ((r, c), val) <- sheet, r >= r1, r <= r2, c >= c1, c <= c2]
-  where eval (Number x) = x
-        eval (Formula f) = f sheet
+sumRange (r1, c1) (r2, c2) sheet =
+    sum [ val | ((r, c), _) <- sheet, r >= r1, r <= r2, c >= c1, c <= c2
+              , Just val <- [evalCell (r, c) sheet] ]
+
 
 -- 7. Applies a numeric function to all cells in a given range
 mapRange :: (Double -> Double) -> Position -> Position -> Spreadsheet -> Spreadsheet
@@ -127,17 +145,22 @@ mapRange f (r1, c1) (r2, c2) sheet =
 
 -- 8. Sorts spreadsheet by numeric values, ignoring formulas
 sortCellsByValue :: Spreadsheet -> Spreadsheet
-sortCellsByValue sheet = 
-    let (nums, formulas) = partition isNumber sheet
-        sortedNums = sortBy (comparing (extractNum . snd)) nums
-    in sortedNums ++ formulas
-  where 
-    isNumber (_, Number _) = True
-    isNumber _ = False
-    extractNum (Number x) = x
-    extractNum _ = 0  -- Default value
+sortCellsByValue sheet =
+    let -- Extract only numeric/evaluable values with original positions
+        cellsWithValues = [((r, c), val) | ((r, c), val) <- sheet, evalCell (r, c) sheet /= Nothing]
+        values = map (\(pos, _) -> evalCell pos sheet) cellsWithValues
+        sortedValues = map Number $ sortOn id (mapMaybe id values)
+        updatedCells = zip (map fst cellsWithValues) sortedValues
 
--- Interactive loop with more features
+        -- Replace only the numeric cells with new values, keep others untouched
+        resultSheet = map (\(pos, val) ->
+            case lookup pos updatedCells of
+                Just newVal -> (pos, newVal)
+                Nothing     -> (pos, val)) sheet
+    in resultSheet
+    
+
+-- Menu for the user to interact and touch the spreadsheet
 menu :: Spreadsheet -> IO ()
 menu sheet = do
     putStrLn "\nOptions:"
@@ -146,7 +169,7 @@ menu sheet = do
     putStrLn "3. Update a Cell"
     putStrLn "4. Apply a function to all the cells in the spreadsheet"
     putStrLn "5. Filter cells by value"
-    putStrLn "6. Count Cells by"
+    putStrLn "6. Count Cells based on a predicate"
     putStrLn "7. Sum a range of cells"
     putStrLn "8. Apply a function to a range of cells"
     putStrLn "9. Sort cells by value"
@@ -268,8 +291,6 @@ menu sheet = do
             putStrLn "Filtered Spreadsheet:"
             printSpreadsheet filteredSheet
             menu sheet
-
---Do we want that the filtered number appears with the position of the cell??
         "6" -> do
             putStrLn "Enter condition type:"
             putStrLn "1. Greater than (>)"
@@ -285,12 +306,11 @@ menu sheet = do
                     "1" -> (> threshold)
                     "2" -> (< threshold)
                     "3" -> (== threshold)
-                    _   -> const False  -- Invalid input, always false
+                    _   -> const False  
 
             let count = countCellsBy cond sheet
             putStrLn $ "Count of matching cells: " ++ show count
             menu sheet
-        --Do we want to show the cells that has that value or just the number of the cells that matches that?
         "7" -> do
             putStr "Enter start cell (e.g., A1 or (1,2)): "
             startCell <- getLine
@@ -365,9 +385,7 @@ menu sheet = do
 main :: IO ()
 main = do
     putStrLn "Welcome to the Spreadsheet Program!"
-    let initialSheet =  [((1,1), Number 10), ((1,2), Formula (\_ -> 20)), 
+    let initialSheet =  [((1,1), Number 576), ((1,2), Formula (\_ -> 20)), 
                         ((2,1), Number 30), ((2,2), Number 40)]
-    --print $ findCycles initialSheet
-    --print $ parseReference "AA1"  -- Expected: Just (1,27)
-    --print $ positionToReference (1, 27)  -- Expected: "AA1"
+    print $ findCycles initialSheet
     menu initialSheet
